@@ -1,0 +1,151 @@
+name: Build brand-logos.zip
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - assets/brands.html
+      - .github/workflows/build-logos-zip.yml
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download logos & zip
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from html.parser import HTMLParser
+          from urllib.parse import urlparse
+          from urllib.request import Request, urlopen
+          from urllib.error import URLError, HTTPError
+          import os, csv, re, time, zipfile, unicodedata, sys
+
+          HTML_PATH = "assets/brands.html"
+          OUT_DIR = "brand-logos"
+          ZIP_PATH = "brand-logos.zip"
+          USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0 Safari/537.36")
+          TIMEOUT = 30
+          RETRY = 2
+
+          class BrandParser(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.in_a = False
+                  self.in_span = False
+                  self.current_img = None
+                  self.current_brand = []
+                  self.pairs = []
+
+              def handle_starttag(self, tag, attrs):
+                  if tag == "a":
+                      self.in_a = True
+                      self.current_img = None
+                      self.current_brand = []
+                  elif self.in_a and tag == "img":
+                      src = dict(attrs).get("src")
+                      if src and not self.current_img:
+                          self.current_img = src
+                  elif self.in_a and tag == "span":
+                      self.in_span = True
+
+              def handle_endtag(self, tag):
+                  if tag == "span":
+                      self.in_span = False
+                  elif tag == "a":
+                      brand = "".join(self.current_brand).strip()
+                      if self.current_img and brand:
+                          self.pairs.append((brand, self.current_img))
+                      self.in_a = False
+                      self.in_span = False
+                      self.current_img = None
+                      self.current_brand = []
+
+              def handle_data(self, data):
+                  if self.in_a and self.in_span:
+                      self.current_brand.append(data)
+
+          def ext_from_url(u):
+              import os
+              p = os.path.basename(urlparse(u).path)
+              _, ext = os.path.splitext(p)
+              return ext.lower() if ext.lower() in (".jpg",".jpeg",".png",".gif",".webp",".svg") else ".jpg"
+
+          def slug(s):
+              s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
+              s = s.lower().replace("&", " and ")
+              s = re.sub(r"[^a-z0-9]+", "-", s)
+              s = re.sub(r"-{2,}", "-", s).strip("-")
+              return s or "logo"
+
+          def download(url, out_path):
+              req = Request(url, headers={"User-Agent": USER_AGENT})
+              for attempt in range(1, RETRY+2):
+                  try:
+                      with urlopen(req, timeout=TIMEOUT) as r, open(out_path, "wb") as f:
+                          f.write(r.read())
+                      return True, "ok"
+                  except (HTTPError, URLError) as e:
+                      if attempt <= RETRY:
+                          time.sleep(0.6 * attempt)
+                          continue
+                      return False, f"{type(e).__name__}: {getattr(e,'code',getattr(e,'reason',str(e)))}"
+                  except Exception as e:
+                      if attempt <= RETRY:
+                          time.sleep(0.6 * attempt)
+                          continue
+                      return False, f"error: {e}"
+
+          if not os.path.exists(HTML_PATH):
+              print(f"Missing {HTML_PATH}", file=sys.stderr)
+              sys.exit(1)
+
+          with open(HTML_PATH, "r", encoding="utf-8") as f:
+              html = f.read()
+
+          parser = BrandParser()
+          parser.feed(html)
+          pairs = parser.pairs
+          if not pairs:
+              print("No (brand, img) pairs found.", file=sys.stderr)
+              sys.exit(1)
+
+          os.makedirs(OUT_DIR, exist_ok=True)
+          manifest = os.path.join(OUT_DIR, "_manifest.csv")
+          with open(manifest, "w", newline="", encoding="utf-8") as csvfile:
+              w = csv.writer(csvfile)
+              w.writerow(["brand","filename","url"])
+              for brand, url in pairs:
+                  name = slug(brand)
+                  ext = ext_from_url(url)
+                  out = os.path.join(OUT_DIR, name + ext)
+                  ok, msg = download(url, out)
+                  if not ok:
+                      # keep visible failure stub
+                      with open(out + ".FAILED.txt", "w", encoding="utf-8") as ff:
+                          ff.write(f"Failed: {url}\n{msg}\n")
+                      fn = os.path.basename(out + ".FAILED.txt")
+                      print(f"[!!] {brand} -> {fn} ({msg})")
+                  else:
+                      fn = os.path.basename(out)
+                      print(f"[OK] {brand} -> {fn}")
+                  w.writerow([brand, fn, url])
+
+          with zipfile.ZipFile(ZIP_PATH, "w", compression=zipfile.ZIP_DEFLATED) as z:
+              for root, _, files in os.walk(OUT_DIR):
+                  for fn in files:
+                      p = os.path.join(root, fn)
+                      z.write(p, arcname=os.path.relpath(p, start=os.path.dirname(OUT_DIR)))
+
+          print(f"Created {ZIP_PATH}")
+          PY
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: brand-logos
+          path: |
+            brand-logos.zip
+            brand-logos/_manifest.csv
